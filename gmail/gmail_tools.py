@@ -1557,7 +1557,12 @@ def _format_gmail_results_plain(
     headers_by_id: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
 ) -> str:
     """Format Gmail search results in clean, LLM-friendly plain text."""
-    if not messages:
+    if next_page_token is not None and (
+        not isinstance(next_page_token, str)
+        or not re.fullmatch(r"[A-Za-z0-9._~+/=-]{1,2048}", next_page_token)
+    ):
+        raise ValueError("invalid Gmail pagination token")
+    if not messages and next_page_token is None:
         return f"No messages found for query: '{query}'"
 
     lines = [
