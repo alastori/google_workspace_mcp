@@ -945,6 +945,7 @@ def get_credentials(
     client_secrets_path: Optional[str] = None,
     credentials_base_dir: str = DEFAULT_CREDENTIALS_DIR,
     session_id: Optional[str] = None,
+    allow_refresh: bool = True,
 ) -> Optional[Credentials]:
     """
     Retrieves stored credentials, prioritizing OAuth 2.1 store, then session, then file. Refreshes if necessary.
@@ -987,6 +988,8 @@ def get_credentials(
                     # Refresh invalid credentials before checking scopes
                     if (not credentials.valid) and credentials.refresh_token:
                         try:
+                            if not allow_refresh:
+                                return None
                             credentials.refresh(Request())
                             logger.info(
                                 f"[get_credentials] Refreshed OAuth 2.1 credentials for session {session_id}"
@@ -1158,6 +1161,8 @@ def get_credentials(
             logger.debug(
                 "[get_credentials] Refreshing token using embedded client credentials"
             )
+            if not allow_refresh:
+                return None
             credentials.refresh(Request())
             logger.info(
                 f"[get_credentials] Credentials refreshed successfully. User: '{user_google_email}', Session: '{session_id}'"
@@ -1296,6 +1301,7 @@ async def get_authenticated_google_service(
     user_google_email: str,  # Required - no more Optional
     required_scopes: List[str],
     session_id: Optional[str] = None,  # Session context for logging
+    allow_refresh: bool = True,
 ) -> tuple[Any, str]:
     """
     Centralized Google service authentication for all MCP tools.
@@ -1373,9 +1379,12 @@ async def get_authenticated_google_service(
         required_scopes=required_scopes,
         client_secrets_path=CONFIG_CLIENT_SECRETS_PATH,
         session_id=session_id,  # Pass through session context
+        **({"allow_refresh": False} if not allow_refresh else {}),
     )
 
     if not credentials or not credentials.valid:
+        if not allow_refresh:
+            raise GoogleAuthenticationError("bounded_gmail_credentials_unavailable")
         logger.warning(
             f"[{tool_name}] No valid credentials. Email: '{user_google_email}'."
         )

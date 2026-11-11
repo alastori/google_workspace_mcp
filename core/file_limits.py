@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import time
 from typing import Any, Optional
 
 import httpx
+from httpcore._async.http11 import AsyncHTTP11Connection
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
@@ -37,6 +39,112 @@ _MAX_ERROR_BODY_BYTES = 64 * 1024  # 64 KiB
 
 class FileTooLargeError(ValueError):
     """Raised when a download would exceed ``WORKSPACE_MCP_MAX_FILE_BYTES``."""
+
+
+class StrictHTTPBudget:
+    """Shared, fail-closed entity/request budget for explicitly bounded reads.
+
+    Reserve one complete response cap plus the qualified HTTP/1.1 read allowance
+    before dispatch. Successful reads release unused reservation. Failed reads
+    retain it and close the budget, including header-time body prefetch.
+    """
+
+    READ_ALLOWANCE = 64 * 1024
+
+    def __init__(self, *, max_bytes: int, max_requests: int, deadline_seconds: float):
+        if (
+            type(max_bytes) is not int
+            or max_bytes <= 0
+            or type(max_requests) is not int
+            or max_requests <= 0
+            or isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or not 0 < deadline_seconds <= 120
+        ):
+            raise ValueError("invalid strict HTTP budget")
+        self.max_bytes = max_bytes
+        self.max_requests = max_requests
+        self.deadline = time.monotonic() + deadline_seconds
+        self.response_bytes = 0
+        self.requests = 0
+        self.closed = False
+        self._lock = asyncio.Lock()
+
+    async def download(self, url, *, headers, method, limit):
+        async with self._lock:
+            if type(limit) is not int or limit <= 0 or method.upper() != "GET":
+                raise ValueError("strict HTTP response limit and GET required")
+            reservation = limit + self.READ_ALLOWANCE
+            remaining_time = self.deadline - time.monotonic()
+            if (
+                self.closed
+                or self.requests >= self.max_requests
+                or self.response_bytes + reservation > self.max_bytes
+                or remaining_time <= 0
+                or AsyncHTTP11Connection.READ_NUM_BYTES > self.READ_ALLOWANCE
+            ):
+                self.closed = True
+                raise ValueError("strict HTTP budget exhausted or transport changed")
+            self.requests += 1
+            self.response_bytes += reservation
+            try:
+                content = await asyncio.wait_for(
+                    self._read(
+                        url,
+                        headers=headers,
+                        limit=limit,
+                        timeout=min(5.0, remaining_time),
+                    ),
+                    timeout=min(5.0, remaining_time),
+                )
+                if time.monotonic() >= self.deadline:
+                    raise TimeoutError("strict HTTP operation deadline")
+            except BaseException:
+                self.closed = True
+                raise
+            self.response_bytes -= reservation - len(content)
+            return content
+
+    async def _read(self, url, *, headers, limit, timeout):
+        request_headers = {
+            key: value
+            for key, value in (headers or {}).items()
+            if key.lower() != "accept-encoding"
+        }
+        request_headers["Accept-Encoding"] = "identity"
+        transport = httpx.AsyncHTTPTransport(retries=0, http2=False, trust_env=False)
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+            http2=False,
+            transport=transport,
+        ) as client:
+            async with client.stream("GET", url, headers=request_headers) as response:
+                if response.headers.get("content-encoding", "").strip().lower() not in {
+                    "",
+                    "identity",
+                }:
+                    raise ValueError("strict HTTP unsupported content encoding")
+                declared = response.headers.get("content-length")
+                if declared is not None:
+                    if (
+                        not declared.isascii()
+                        or not declared.isdecimal()
+                        or int(declared) > limit
+                    ):
+                        raise ValueError("strict HTTP response limit")
+                content = io.BytesIO()
+                async for chunk in response.aiter_raw():
+                    if (
+                        len(chunk) > self.READ_ALLOWANCE
+                        or content.tell() + len(chunk) > limit
+                    ):
+                        raise ValueError("strict HTTP response limit")
+                    content.write(chunk)
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise ValueError("strict HTTP response status")
+                return content.getvalue()
 
 
 def get_max_file_bytes() -> Optional[int]:
@@ -288,14 +396,21 @@ async def download_http_url_bytes(
     web_view_link: Optional[str] = None,
     kind: str = "file",
     max_bytes: Optional[int] = None,
+    strict_budget: Optional[StrictHTTPBudget] = None,
 ) -> bytes:
     """Download ``url`` into memory, honoring ``WORKSPACE_MCP_MAX_FILE_BYTES``.
 
     When a cap is set, streams and aborts on Content-Length or mid-body.
+    An explicit strict_budget shares conservative entity accounting and an absolute
+    deadline across GETs, with identity encoding and zero redirects or retries.
     Raises ``FileTooLargeError`` when over the limit, or
     ``httpx.HTTPStatusError`` for non-2xx responses.
     """
     limit = get_max_file_bytes() if max_bytes is None else max_bytes
+    if strict_budget is not None:
+        return await strict_budget.download(
+            url, headers=headers, method=method, limit=limit
+        )
     req_headers = dict(headers or {})
     timeout = httpx.Timeout(120.0, connect=30.0)
     method = method.upper()

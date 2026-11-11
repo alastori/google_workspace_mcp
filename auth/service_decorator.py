@@ -320,6 +320,8 @@ async def _authenticate_service(
     resolved_scopes: List[str],
     mcp_session_id: Optional[str],
     authenticated_user: Optional[str],
+    *,
+    allow_refresh: bool = True,
 ) -> Tuple[Any, str]:
     """
     Authenticate and get Google service using appropriate OAuth version.
@@ -327,6 +329,10 @@ async def _authenticate_service(
     Returns:
         Tuple of (service, actual_user_email)
     """
+    if not allow_refresh and (
+        use_oauth21 or is_service_account_enabled() or is_trust_gateway_identity()
+    ):
+        raise GoogleAuthenticationError("bounded_gmail_legacy_credentials_required")
     if is_service_account_enabled():
         canonical_email = _get_configured_user_google_email()
         if not canonical_email:
@@ -381,6 +387,7 @@ async def _authenticate_service(
             user_google_email=user_google_email,
             required_scopes=resolved_scopes,
             session_id=mcp_session_id,
+            **({"allow_refresh": False} if not allow_refresh else {}),
         )
 
 
@@ -796,6 +803,13 @@ def require_google_service(
             # Note: `args` and `kwargs` are now the arguments for the *wrapper*,
             # which does not include 'service'.
 
+            bounded_matching = (
+                func.__name__ == "get_gmail_messages_content_batch"
+                and wrapper_sig.bind_partial(*args, **kwargs).arguments.get(
+                    "matching_review"
+                )
+                is not None
+            )
             # Get authentication context early to determine OAuth mode
             authenticated_user, auth_method, mcp_session_id = await _get_auth_context(
                 func.__name__
@@ -862,6 +876,7 @@ def require_google_service(
                     resolved_scopes,
                     mcp_session_id,
                     authenticated_user,
+                    **({"allow_refresh": False} if bounded_matching else {}),
                 )
             except GoogleAuthenticationError as e:
                 logger.error(

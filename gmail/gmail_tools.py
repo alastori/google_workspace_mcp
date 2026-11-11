@@ -75,6 +75,7 @@ from gmail.gmail_helpers import (
     _get_send_as_signature_html_for_tool,
     _http_error_status,
     _require_verified_gmail_account,
+    _review_matching_gmail,
     _retryable_result_ids,
     _signature_html_to_text,
     _wrap_signature_html,
@@ -1969,6 +1970,7 @@ async def get_gmail_messages_content_batch(
     ] = "text",
     require_verified_account: bool = False,
     expected_account: Optional[str] = None,
+    matching_review: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Retrieves the content of multiple Gmail messages in a single batch request.
@@ -1990,6 +1992,19 @@ async def get_gmail_messages_content_batch(
     Returns:
         str: A formatted list of message contents including subject, sender, date, Message-ID, recipients (To, Cc), and body (if full format).
     """
+    if matching_review is not None:
+        if (
+            require_verified_account is not True
+            or format != "full"
+            or body_format != "text"
+        ):
+            raise ValueError("matching Gmail review requires verified text mode")
+        return json.dumps(
+            await _review_matching_gmail(
+                service, message_ids, matching_review, expected_account
+            ),
+            ensure_ascii=False,
+        )
     if type(require_verified_account) is not bool:
         raise ValueError("require_verified_account must be a Boolean")
     if require_verified_account:
