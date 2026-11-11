@@ -168,6 +168,33 @@ GMAIL_LABEL_COLORS = frozenset(
 )
 
 
+async def _require_verified_gmail_account(service, expected_email: str) -> None:
+    """Compare the requested account with the same service's authenticated profile."""
+    email_pattern = r"[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}"
+    if (
+        not isinstance(expected_email, str)
+        or len(expected_email) > 254
+        or not re.fullmatch(email_pattern, expected_email)
+    ):
+        raise ValueError("gmail_authenticated_account_unavailable")
+
+    try:
+        profile = await asyncio.to_thread(
+            service.users().getProfile(userId="me", fields="emailAddress").execute
+        )
+    except Exception:
+        raise ValueError("gmail_authenticated_account_unavailable") from None
+
+    actual_email = profile.get("emailAddress") if isinstance(profile, dict) else None
+    if (
+        not isinstance(actual_email, str)
+        or len(actual_email) > 254
+        or not re.fullmatch(email_pattern, actual_email)
+        or actual_email.casefold() != expected_email.casefold()
+    ):
+        raise ValueError("gmail_authenticated_account_unavailable")
+
+
 def _validate_label_color(field: str, value: str) -> str:
     """Normalize one label color and check it against Gmail's fixed palette.
 

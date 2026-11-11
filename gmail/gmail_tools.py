@@ -74,6 +74,7 @@ from gmail.gmail_helpers import (
     _get_send_as_identity_and_signature,
     _get_send_as_signature_html_for_tool,
     _http_error_status,
+    _require_verified_gmail_account,
     _retryable_result_ids,
     _signature_html_to_text,
     _wrap_signature_html,
@@ -1658,6 +1659,9 @@ async def search_gmail_messages(
     page_size: int = 10,
     page_token: Optional[str] = None,
     include_headers: bool = False,
+    include_spam_trash: bool = False,
+    require_verified_account: bool = False,
+    expected_account: Optional[str] = None,
 ) -> str:
     """
     Searches messages in a user's Gmail account based on a query.
@@ -1669,6 +1673,12 @@ async def search_gmail_messages(
         user_google_email (str): The user's Google email address. Required.
         page_size (int): The maximum number of messages to return. Defaults to 10.
         page_token (Optional[str]): Token for retrieving the next page of results. Use the next_page_token from a previous response.
+        include_spam_trash (bool): Include Spam and Trash when explicitly requested. Defaults to False.
+        require_verified_account (bool): Require the same authenticated service profile
+            to match expected_account before searching. Defaults to False for existing callers.
+        expected_account (Optional[str]): Explicit expected account, independently supplied
+            by the qualified caller. Required when require_verified_account is True.
+            Authentication wrappers may replace user_google_email without changing this value.
         include_headers (bool): If True, also fetch each message's metadata and include
             Subject, From, and Date per result. Costs one metadata get per result,
             grouped into HTTP batches of up to 10, plus retries for transient failures.
@@ -1679,13 +1689,26 @@ async def search_gmail_messages(
         With include_headers=True, each result also includes Subject, From, and Date.
         Includes pagination token if more results are available.
     """
+    if type(require_verified_account) is not bool:
+        raise ValueError("require_verified_account must be a Boolean")
+    if require_verified_account:
+        await _require_verified_gmail_account(service, expected_account)
+
     logger.info(
         f"[search_gmail_messages] Email: '{user_google_email}', query_len={len(query)}, Page size: {page_size}"
     )
     logger.debug(f"[search_gmail_messages] Query: '{query}'")
 
+    if type(include_spam_trash) is not bool:
+        raise ValueError("include_spam_trash must be a Boolean")
+
     # Build the API request parameters
-    request_params = {"userId": "me", "q": query, "maxResults": page_size}
+    request_params = {
+        "userId": "me",
+        "q": query,
+        "maxResults": page_size,
+        "includeSpamTrash": include_spam_trash,
+    }
 
     # Add page token if provided
     if page_token:
