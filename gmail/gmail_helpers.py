@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import json
+import time
 import html
 import logging
 import re
@@ -15,6 +20,8 @@ from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Option
 
 from fastmcp.exceptions import ToolError as ToolExecutionError
 from googleapiclient.errors import HttpError
+from urllib.parse import urlsplit
+from core.file_limits import StrictHTTPBudget, download_http_url_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +175,9 @@ GMAIL_LABEL_COLORS = frozenset(
 )
 
 
-async def _require_verified_gmail_account(service, expected_email: str) -> None:
+async def _require_verified_gmail_account(
+    service, expected_email: str, *, profile_loader=None
+) -> None:
     """Compare the requested account with the same service's authenticated profile."""
     email_pattern = r"[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}"
     if (
@@ -179,9 +188,12 @@ async def _require_verified_gmail_account(service, expected_email: str) -> None:
         raise ValueError("gmail_authenticated_account_unavailable")
 
     try:
-        profile = await asyncio.to_thread(
-            service.users().getProfile(userId="me", fields="emailAddress").execute
-        )
+        if profile_loader is None:
+            profile = await asyncio.to_thread(
+                service.users().getProfile(userId="me", fields="emailAddress").execute
+            )
+        else:
+            profile = await profile_loader()
     except Exception:
         raise ValueError("gmail_authenticated_account_unavailable") from None
 
@@ -1068,3 +1080,337 @@ async def _get_send_as_signature_html_for_tool(
 ) -> str:
     """Fetch signature HTML and convert non-benign failures to tool errors."""
     return await _get_send_as_signature_html(service, from_email=from_email)
+
+
+def _matching_json(raw):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise ValueError("gmail_matching_duplicate_json_key")
+            value[key] = item
+        return value
+
+    def constant(value):
+        raise ValueError("gmail_matching_non_json_constant")
+
+    try:
+        return json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=pairs,
+            parse_constant=constant,
+        )
+    except (ValueError, UnicodeError, RecursionError):
+        raise ValueError("gmail_matching_json_unavailable") from None
+
+
+async def _matching_request(request, budget, limit, credential_pin):
+    uri = getattr(request, "uri", "")
+    parsed = urlsplit(uri)
+    credentials = getattr(getattr(request, "http", None), "credentials", None)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "gmail.googleapis.com"
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or not parsed.path.startswith("/gmail/v1/users/me/")
+        or getattr(request, "method", None) != "GET"
+        or credentials is None
+        or credentials.valid is not True
+        or credentials.expired is not False
+    ):
+        raise ValueError("gmail_matching_authenticated_request_unavailable")
+    if (
+        credentials is not credential_pin[0]
+        or getattr(credentials, "token", None) != credential_pin[1]
+    ):
+        raise ValueError("gmail_matching_credential_changed")
+    headers = {
+        key: value
+        for key, value in (getattr(request, "headers", {}) or {}).items()
+        if key.lower() not in {"authorization", "proxy-authorization"}
+    }
+    # apply() only attaches the already valid token. before_request() may refresh.
+    credentials.apply(headers)
+    raw = await download_http_url_bytes(
+        uri, headers=headers, max_bytes=limit, strict_budget=budget
+    )
+    result = _matching_json(raw)
+    if time.monotonic() >= budget.deadline:
+        raise ValueError("gmail_matching_deadline")
+    return result
+
+
+def _matching_timestamp(value):
+    if not isinstance(value, str) or not re.fullmatch(r"0|[1-9][0-9]{0,15}", value):
+        raise ValueError("gmail_matching_timestamp_unavailable")
+    timestamp = int(value)
+    if timestamp > 253402300799999:
+        raise ValueError("gmail_matching_timestamp_unavailable")
+    return timestamp
+
+
+def _matching_text(payload):
+    stack = [(payload, 0)]
+    count = 0
+    text = []
+    while stack:
+        part, depth = stack.pop()
+        count += 1
+        if not isinstance(part, dict) or depth > 10 or count > 100:
+            raise ValueError("gmail_matching_mime_limit")
+        mime = part.get("mimeType")
+        if not isinstance(mime, str):
+            raise ValueError("gmail_matching_mime_unavailable")
+        body = part.get("body", {})
+        children = part.get("parts", [])
+        if (
+            not isinstance(body, dict)
+            or not isinstance(children, list)
+            or len(children) > 100
+        ):
+            raise ValueError("gmail_matching_mime_unavailable")
+        data = body.get("data")
+        if data is not None:
+            if not isinstance(data, str) or not re.fullmatch(
+                r"[A-Za-z0-9_-]*={0,2}", data
+            ):
+                raise ValueError("gmail_matching_mime_encoding")
+            try:
+                decoded = base64.b64decode(
+                    data + "=" * (-len(data) % 4), altchars=b"-_", validate=True
+                )
+                if mime.casefold() == "text/plain":
+                    text.append(decoded.decode("utf-8", errors="strict"))
+            except (ValueError, binascii.Error, UnicodeError):
+                raise ValueError("gmail_matching_mime_encoding") from None
+        stack.extend((child, depth + 1) for child in reversed(children))
+    return "\n".join(text)
+
+
+async def _review_matching_gmail(service, message_ids, scope, expected_account):
+    """Read only caller-issued matching IDs. Never enumerate thread members."""
+    fields = {
+        "since",
+        "until",
+        "members",
+        "query_provenance",
+        "issued_thread_ids",
+        "observed_message_count",
+    }
+    if (
+        not isinstance(scope, dict)
+        or set(scope) != fields
+        or not isinstance(message_ids, list)
+        or not 1 <= len(message_ids) <= 20
+        or any(
+            not isinstance(mid, str) or not re.fullmatch(r"[0-9a-f]{1,64}", mid)
+            for mid in message_ids
+        )
+        or len(set(message_ids)) != len(message_ids)
+        or not isinstance(scope["members"], dict)
+        or set(scope["members"]) != set(message_ids)
+        or not isinstance(scope["query_provenance"], dict)
+        or set(scope["query_provenance"]) != set(message_ids)
+    ):
+        raise ValueError("gmail_matching_membership_unavailable")
+    members = scope["members"]
+    issued = scope["issued_thread_ids"]
+    if (
+        any(
+            not isinstance(tid, str) or not re.fullmatch(r"[0-9a-f]{1,64}", tid)
+            for tid in members.values()
+        )
+        or len(set(members.values())) > 3
+        or not isinstance(issued, list)
+        or not 1 <= len(issued) <= 500
+        or any(
+            not isinstance(tid, str) or not re.fullmatch(r"[0-9a-f]{1,64}", tid)
+            for tid in issued
+        )
+        or len(set(issued)) != len(issued)
+        or not set(members.values()) <= set(issued)
+        or type(scope["observed_message_count"]) is not int
+        or not len(message_ids) <= scope["observed_message_count"] <= 500
+    ):
+        raise ValueError("gmail_matching_thread_provenance_unavailable")
+    fingerprints = {}
+    for mid, queries in scope["query_provenance"].items():
+        if (
+            not isinstance(queries, list)
+            or not 1 <= len(queries) <= 5
+            or any(
+                not isinstance(query, str)
+                or not 1 <= len(query.encode("utf-8")) <= 4096
+                for query in queries
+            )
+            or len(set(queries)) != len(queries)
+        ):
+            raise ValueError("gmail_matching_query_provenance_unavailable")
+        fingerprints[mid] = [
+            hashlib.sha256(query.encode("utf-8")).hexdigest() for query in queries
+        ]
+    bounds = []
+    for key in ["since", "until"]:
+        if not isinstance(scope[key], str):
+            raise ValueError("gmail_matching_window")
+        moment = datetime.fromisoformat(scope[key].replace("Z", "+00:00"))
+        if (
+            moment.tzinfo is None
+            or moment.utcoffset() is None
+            or moment.microsecond
+            or moment.utcoffset().microseconds
+        ):
+            raise ValueError("gmail_matching_window")
+        bounds.append(int(moment.timestamp()) * 1000)
+    if not 0 <= bounds[0] < bounds[1]:
+        raise ValueError("gmail_matching_window")
+    budget = StrictHTTPBudget(
+        max_bytes=8 * 1024**2, max_requests=46, deadline_seconds=120
+    )
+    items, unavailable = [], []
+    metadata_reads = body_reads = 0
+
+    async def read(request, limit):
+        profile_request = service.users().getProfile(userId="me", fields="emailAddress")
+        credentials = getattr(
+            getattr(profile_request, "http", None), "credentials", None
+        )
+        token = getattr(credentials, "token", None)
+        if not isinstance(token, str) or not token:
+            raise ValueError("gmail_matching_credential_unavailable")
+        pin = (credentials, token)
+
+        async def profile():
+            return await _matching_request(profile_request, budget, 4096, pin)
+
+        await _require_verified_gmail_account(
+            service, expected_account, profile_loader=profile
+        )
+        return await _matching_request(request, budget, limit, pin)
+
+    try:
+        for offset, mid in enumerate(message_ids):
+            reservation = 1048576 + 3 * 4096 + 4 * budget.READ_ALLOWANCE
+            if (
+                budget.requests + 4 > 46
+                or budget.response_bytes + reservation > budget.max_bytes
+                or time.monotonic() >= budget.deadline
+            ):
+                unavailable.extend(
+                    dict(id=remaining, reason="budget_exhausted")
+                    for remaining in message_ids[offset:]
+                )
+                break
+            metadata = await read(
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=mid,
+                    format="full",
+                    fields="id,threadId,internalDate",
+                ),
+                4096,
+            )
+            metadata_reads += 1
+            if (
+                not isinstance(metadata, dict)
+                or set(metadata) != {"id", "threadId", "internalDate"}
+                or metadata["id"] != mid
+                or metadata["threadId"] != members[mid]
+            ):
+                raise ValueError("gmail_matching_identity_changed")
+            stamp = _matching_timestamp(metadata["internalDate"])
+            if not bounds[0] <= stamp < bounds[1]:
+                unavailable.append(dict(id=mid, reason="outside_window"))
+                continue
+            response = await read(
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=mid,
+                    format="full",
+                    fields="id,threadId,internalDate,payload",
+                ),
+                1048576,
+            )
+            body_reads += 1
+            if (
+                not isinstance(response, dict)
+                or set(response) != {"id", "threadId", "internalDate", "payload"}
+                or response["id"] != mid
+                or response["threadId"] != members[mid]
+                or _matching_timestamp(response["internalDate"]) != stamp
+            ):
+                raise ValueError("gmail_matching_body_identity_changed")
+            try:
+                text = _matching_text(response["payload"])
+            except (ValueError, UnicodeError):
+                unavailable.append(dict(id=mid, reason="content_unavailable"))
+                continue
+            if not text:
+                unavailable.append(dict(id=mid, reason="text_plain_unavailable"))
+                continue
+            item = dict(
+                id=mid,
+                thread_id=members[mid],
+                timestamp_ms=stamp,
+                text=text,
+                query_fingerprints=fingerprints[mid],
+            )
+            if (
+                len(json.dumps(items + [item], ensure_ascii=False).encode("utf-8"))
+                > 192 * 1024
+            ):
+                unavailable.extend(
+                    dict(id=remaining, reason="output_limit")
+                    for remaining in message_ids[offset:]
+                )
+                break
+            items.append(item)
+        selected = sorted(set(members.values()))
+        result = dict(
+            version="inbox.gmail-matching-review.v1",
+            coverage="matching_messages_only",
+            selected_message_ids=message_ids,
+            selected_thread_ids=selected,
+            omitted_thread_ids=sorted(set(issued) - set(selected)),
+            observed_matching_messages=scope["observed_message_count"],
+            matching_messages_not_selected=scope["observed_message_count"]
+            - len(message_ids),
+            items=items,
+            unavailable_messages=unavailable,
+            groups=[
+                dict(
+                    thread_id=tid,
+                    message_ids=[
+                        item["id"] for item in items if item["thread_id"] == tid
+                    ],
+                )
+                for tid in selected
+            ],
+            metadata_reads=metadata_reads,
+            body_reads=body_reads,
+            gmail_requests=budget.requests,
+            response_entity_bytes=budget.response_bytes,
+            limitations=[
+                "matching_message_coverage",
+                "unseen_replies_not_enumerated",
+                "reply_completeness_unavailable",
+                "original_reply_commitment_pending",
+                "matching_predicates_from_search_provenance",
+                "post_search_predicate_changes_unverified",
+            ],
+        )
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 262144:
+            raise ValueError("gmail_matching_output_limit")
+        if time.monotonic() >= budget.deadline:
+            raise ValueError("gmail_matching_deadline")
+        return result
+    except BaseException:
+        budget.closed = True
+        raise
