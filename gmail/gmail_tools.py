@@ -1807,6 +1807,8 @@ async def get_gmail_message_content(
             ),
         ),
     ] = False,
+    require_verified_account: bool = False,
+    expected_account: Optional[str] = None,
 ) -> str:
     """
     Retrieves the full content (subject, sender, recipients, body) of a specific Gmail message.
@@ -1821,6 +1823,10 @@ async def get_gmail_message_content(
     Args:
         message_id (str): The unique ID of the Gmail message to retrieve.
         user_google_email (str): The user's Google email address. Required.
+        require_verified_account (bool): Verify the same service's authenticated account
+            before any message request. Defaults to False for existing callers.
+        expected_account (Optional[str]): Independent expected account supplied by the
+            qualified caller. Required when require_verified_account is True.
         body_format (Literal["text", "html", "raw"]): Body output format.
             "text" (default) returns plaintext (HTML converted to text as fallback).
             "html" returns the raw HTML body as-is without conversion.
@@ -1839,6 +1845,11 @@ async def get_gmail_message_content(
             URL or path in place of the body (the untruncated body itself in stateless
             mode).
     """
+    if type(require_verified_account) is not bool:
+        raise ValueError("require_verified_account must be a Boolean")
+    if require_verified_account:
+        await _require_verified_gmail_account(service, expected_account)
+
     logger.info(
         f"[get_gmail_message_content] Invoked. Message ID: '{message_id}', "
         f"Email: '{user_google_email}', body_format='{body_format}', full={full}"
@@ -1956,6 +1967,8 @@ async def get_gmail_messages_content_batch(
             ),
         ),
     ] = "text",
+    require_verified_account: bool = False,
+    expected_account: Optional[str] = None,
 ) -> str:
     """
     Retrieves the content of multiple Gmail messages in a single batch request.
@@ -1964,6 +1977,10 @@ async def get_gmail_messages_content_batch(
     Args:
         message_ids (List[str]): List of Gmail message IDs to retrieve (max 25 per batch).
         user_google_email (str): The user's Google email address. Required.
+        require_verified_account (bool): Verify the same service's authenticated account
+            before any message request. Defaults to False for existing callers.
+        expected_account (Optional[str]): Independent expected account supplied by the
+            qualified caller. Required when require_verified_account is True.
         format (Literal["full", "metadata"]): Message format. "full" includes body, "metadata" only headers.
         body_format (Literal["text", "html", "raw"]): Body output format (only applies when format='full').
             "text" (default) returns plaintext (HTML converted to text as fallback).
@@ -1973,6 +1990,11 @@ async def get_gmail_messages_content_batch(
     Returns:
         str: A formatted list of message contents including subject, sender, date, Message-ID, recipients (To, Cc), and body (if full format).
     """
+    if type(require_verified_account) is not bool:
+        raise ValueError("require_verified_account must be a Boolean")
+    if require_verified_account:
+        await _require_verified_gmail_account(service, expected_account)
+
     logger.info(
         f"[get_gmail_messages_content_batch] Invoked. Message count: {len(message_ids)}, Email: '{user_google_email}'"
     )
